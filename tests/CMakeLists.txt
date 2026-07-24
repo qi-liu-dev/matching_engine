@@ -1,0 +1,10 @@
+add_executable(matching_engine_tests test_main.cpp)
+
+target_link_libraries(matching_engine_tests PRIVATE matching_engine::matching_engine)
+target_compile_features(matching_engine_tests PRIVATE cxx_std_20)
+set_target_properties(matching_engine_tests PROPERTIES CXX_EXTENSIONS OFF)
+
+matching_engine_enable_warnings(matching_engine_tests)
+matching_engine_enable_sanitizers(matching_engine_tests)
+
+add_test(NAME matching_engine_tests COMMAND matching_engine_tests)

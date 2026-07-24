@@ -1,0 +1,5 @@
+# CMake build directories
+build/
+
+# Local editor and OS files
+.DS_Store
