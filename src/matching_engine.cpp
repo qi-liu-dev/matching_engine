@@ -1,8 +1,21 @@
 #include "matching_engine/matching_engine.hpp"
 
 #include <algorithm>
+#include <limits>
+#include <stdexcept>
 
 namespace matching_engine {
+namespace {
+
+Quantity add_depth_quantity(Quantity total, Quantity quantity) {
+  if (quantity > std::numeric_limits<Quantity>::max() - total) {
+    throw std::overflow_error{"depth quantity exceeds Quantity range"};
+  }
+
+  return total + quantity;
+}
+
+} // namespace
 
 SubmitResult MatchingEngine::submit_limit(OrderRequest request) {
   const ErrorCode validation_error = validate_limit_order_request(request);
@@ -112,11 +125,65 @@ std::optional<Price> MatchingEngine::best_ask() const noexcept {
   return asks_.begin()->first;
 }
 
-std::vector<DepthLevel> MatchingEngine::depth(Side, std::size_t) const {
-  return {};
+std::vector<DepthLevel> MatchingEngine::depth(Side side,
+                                              std::size_t levels) const {
+  std::vector<DepthLevel> result;
+
+  if (side == Side::Buy) {
+    for (const auto &[price, level] : bids_) {
+      if (result.size() == levels) {
+        break;
+      }
+
+      Quantity quantity{};
+      for (const RestingOrder &order : level.orders) {
+        quantity = add_depth_quantity(quantity, order.quantity);
+      }
+      result.push_back(DepthLevel{.price = price, .quantity = quantity});
+    }
+    return result;
+  }
+
+  for (const auto &[price, level] : asks_) {
+    if (result.size() == levels) {
+      break;
+    }
+
+    Quantity quantity{};
+    for (const RestingOrder &order : level.orders) {
+      quantity = add_depth_quantity(quantity, order.quantity);
+    }
+    result.push_back(DepthLevel{.price = price, .quantity = quantity});
+  }
+  return result;
 }
 
-BookSnapshot MatchingEngine::snapshot() const { return {}; }
+BookSnapshot MatchingEngine::snapshot() const {
+  BookSnapshot result;
+  result.orders.reserve(order_index_.size());
+
+  for (const auto &[price, level] : bids_) {
+    for (const RestingOrder &order : level.orders) {
+      result.orders.push_back(SnapshotOrder{.id = order.id,
+                                            .side = Side::Buy,
+                                            .price = price,
+                                            .quantity = order.quantity,
+                                            .sequence = order.sequence});
+    }
+  }
+
+  for (const auto &[price, level] : asks_) {
+    for (const RestingOrder &order : level.orders) {
+      result.orders.push_back(SnapshotOrder{.id = order.id,
+                                            .side = Side::Sell,
+                                            .price = price,
+                                            .quantity = order.quantity,
+                                            .sequence = order.sequence});
+    }
+  }
+
+  return result;
+}
 
 SubmitResult MatchingEngine::submit_buy_limit(OrderRequest request) {
   SubmitResult result{};
@@ -269,8 +336,10 @@ SubmitResult MatchingEngine::submit_sell_market(MarketOrderRequest request) {
 }
 
 void MatchingEngine::rest_order(OrderRequest request) {
-  const RestingOrder order{
-      .id = request.id, .price = request.price, .quantity = request.quantity};
+  const RestingOrder order{.id = request.id,
+                           .price = request.price,
+                           .quantity = request.quantity,
+                           .sequence = next_sequence_};
 
   if (request.side == Side::Buy) {
     auto [level, inserted] = bids_.try_emplace(request.price);
@@ -280,6 +349,7 @@ void MatchingEngine::rest_order(OrderRequest request) {
     order_index_.emplace(request.id, OrderLocation{.side = request.side,
                                                    .price = request.price,
                                                    .order = order_iterator});
+    ++next_sequence_;
     return;
   }
 
@@ -290,6 +360,7 @@ void MatchingEngine::rest_order(OrderRequest request) {
   order_index_.emplace(request.id, OrderLocation{.side = request.side,
                                                  .price = request.price,
                                                  .order = order_iterator});
+  ++next_sequence_;
 }
 
 } // namespace matching_engine

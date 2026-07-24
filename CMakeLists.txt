@@ -34,5 +34,5 @@ if(MATCHING_ENGINE_BUILD_TESTS)
 endif()
 
 if(MATCHING_ENGINE_BUILD_BENCHMARKS)
-  message(STATUS "Benchmark targets are planned for a later milestone.")
+  add_subdirectory(benchmarks)
 endif()

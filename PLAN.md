@@ -3,9 +3,9 @@
 ## Status
 
 This plan defines the implementation path for an educational C++20 limit order
-book and matching engine. Milestone 4A has added market orders after
-cancellation and replacement. Depth, snapshots, and benchmarks are not
-implemented yet.
+book and matching engine. Milestone 5 has added a reproducible benchmark
+baseline after the depth, snapshot, and randomized invariant work. Measured
+optimization remains planned for Milestone 6.
 
 Milestone status values:
 
@@ -302,6 +302,21 @@ overstated expected limit and market matching costs.
 - Market orders never remain active.
 - Trade prices always equal the matched resting order's price.
 
+## Depth and snapshot semantics
+
+- Depth returns at most the requested number of price levels.
+- Bid depth is ordered from highest to lowest price; ask depth is ordered from
+  lowest to highest price.
+- Depth quantity is computed from the resting orders at each price level.
+- If a level's aggregate quantity cannot be represented by `Quantity`, depth
+  throws `std::overflow_error` instead of returning a wrapped or saturated
+  value.
+- Snapshot order is deterministic: bids first in descending price order, then
+  asks in ascending price order, with FIFO order inside each price level.
+- Sequence numbers start at zero and increase when an order rests. Partial
+  fills and same-price non-increasing replacements preserve the sequence;
+  cancel-and-reinsert replacements receive a new one.
+
 ## Test matrix
 
 Domain and validation:
@@ -519,7 +534,7 @@ enter the active-order index.
 
 ### Milestone 4B: Depth, snapshots, and randomized invariants
 
-Status: Planned.
+Status: Complete.
 
 Scope:
 
@@ -531,6 +546,7 @@ Acceptance criteria:
 
 - Depth aggregates quantity by price.
 - Depth returns side-specific ordering.
+- Depth rejects aggregate quantity overflow.
 - Empty-book depth and snapshot behavior is tested.
 - Snapshot order is deterministic and documented.
 - Depth and snapshots do not contain market orders.
@@ -541,7 +557,7 @@ Acceptance criteria:
 
 ### Milestone 5: Benchmark baseline
 
-Status: Planned.
+Status: Complete.
 
 Scope:
 

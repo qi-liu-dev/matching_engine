@@ -10,7 +10,7 @@ trading platform.
 
 ## Current status
 
-Milestone 4A adds market orders to the matching core:
+Milestone 5 adds a reproducible Release benchmark baseline:
 
 - CMake project configuration
 - project-only compiler warnings
@@ -30,10 +30,17 @@ Milestone 4A adds market orders to the matching core:
 - market buys and sells with price-time priority
 - cancellation of unfilled market-order remainders
 - duplicate active ID rejection for market orders
+- top-N depth aggregated by price
+- deterministic bids-first book snapshots
+- resting-order sequence numbers
+- checked depth aggregation that rejects quantity overflow
+- fixed-seed randomized invariant tests
+- five deterministic synthetic benchmark workloads
+- separate throughput and instrumented per-event latency measurements
+- benchmark environment and workload metadata
 - CTest-based tests
 
-Depth, snapshots, parsing, and benchmarks are intentionally deferred to later
-milestones.
+Parsing is intentionally deferred to a later milestone.
 
 ## Build and test
 
@@ -46,6 +53,61 @@ cmake -S . -B build/debug \
 cmake --build build/debug -j
 ctest --test-dir build/debug --output-on-failure
 ```
+
+## Benchmark
+
+Configure and build the Release benchmark target separately:
+
+```bash
+cmake -S . -B build/release \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DMATCHING_ENGINE_BUILD_BENCHMARKS=ON
+
+cmake --build build/release -j
+./build/release/benchmarks/matching_engine_benchmarks
+```
+
+The benchmark is a small C++20 `std::chrono::steady_clock` harness and has no
+additional production dependency. Its deterministic workloads are:
+
+- `non_marketable`: alternating non-crossing bid and ask inserts.
+- `mixed_cancel`: alternating resting inserts and valid cancellations.
+- `highly_marketable`: resting liquidity followed by opposite-side market
+  orders.
+- `single_price`: FIFO inserts concentrated at one bid price.
+- `deep_book`: one resting bid at each of many distinct price levels.
+
+Use `--help` for all options. For example, this runs one workload with explicit
+settings:
+
+```bash
+./build/release/benchmarks/matching_engine_benchmarks \
+  --workload mixed_cancel \
+  --events 100000 \
+  --repetitions 5 \
+  --warmup 2 \
+  --mode all
+```
+
+Each workload is generated and validated before timing. Throughput uses one
+clock interval around a complete event batch and reports events per second.
+Instrumented latency records a clock interval for every event and reports the
+observed minimum, median, mean, and maximum. Each repetition starts with a new
+empty engine. Event execution and result checksumming are included in the
+measurement; workload generation, validation, engine construction, sample
+sorting, and output are excluded.
+
+Output records the compiler, compiler version and flags, build type, operating
+system, architecture, logical CPU count, event count, repetitions, warm-up, and
+workload name. Compare results only when these settings and the machine
+environment are controlled.
+
+The latency mode includes two clock reads and sample storage per event, so it
+measures instrumented latency rather than an unobserved production latency
+distribution. The harness does not pin threads, disable frequency scaling,
+isolate CPU cores, or report tail percentiles. Short runs can be dominated by
+timer resolution and operating-system noise. The README therefore contains no
+performance claims or stored benchmark numbers.
 
 ## Domain conventions
 

@@ -38,6 +38,7 @@ private:
     OrderId id;
     Price price;
     Quantity quantity;
+    SequenceNumber sequence;
   };
 
   struct PriceLevel {
@@ -63,6 +64,7 @@ private:
   BidLevels bids_{};
   AskLevels asks_{};
   std::unordered_map<OrderId, OrderLocation> order_index_{};
+  SequenceNumber next_sequence_{};
 };
 
 } // namespace matching_engine

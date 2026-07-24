@@ -1,18 +1,28 @@
 #include "matching_engine/domain.hpp"
 #include "matching_engine/matching_engine.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <exception>
+#include <functional>
 #include <iostream>
+#include <limits>
+#include <map>
+#include <optional>
+#include <random>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <type_traits>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
 namespace {
 
+using matching_engine::BookSnapshot;
+using matching_engine::DepthLevel;
 using matching_engine::ErrorCode;
 using matching_engine::MarketOrderRequest;
 using matching_engine::MatchingEngine;
@@ -23,6 +33,7 @@ using matching_engine::Quantity;
 using matching_engine::ReplaceRequest;
 using matching_engine::SequenceNumber;
 using matching_engine::Side;
+using matching_engine::SnapshotOrder;
 using matching_engine::Trade;
 
 using TestFunction = void (*)();
@@ -40,6 +51,22 @@ void require_trade(const Trade &trade, OrderId aggressor_id, OrderId resting_id,
   require(trade.resting_id == resting_id, "trade resting ID did not match");
   require(trade.price == price, "trade price did not match");
   require(trade.quantity == quantity, "trade quantity did not match");
+}
+
+void require_depth_level(const DepthLevel &level, Price price,
+                         Quantity quantity) {
+  require(level.price == price, "depth price did not match");
+  require(level.quantity == quantity, "depth quantity did not match");
+}
+
+void require_snapshot_order(const SnapshotOrder &order, OrderId id, Side side,
+                            Price price, Quantity quantity,
+                            SequenceNumber sequence) {
+  require(order.id == id, "snapshot order ID did not match");
+  require(order.side == side, "snapshot side did not match");
+  require(order.price == price, "snapshot price did not match");
+  require(order.quantity == quantity, "snapshot quantity did not match");
+  require(order.sequence == sequence, "snapshot sequence did not match");
 }
 
 void require_not_crossed(const MatchingEngine &engine) {
@@ -612,6 +639,249 @@ void duplicate_active_id_market_order_is_rejected_without_mutation() {
                 Quantity{2});
 }
 
+void empty_book_has_empty_depth_and_snapshot() {
+  const MatchingEngine engine;
+
+  require(engine.depth(Side::Buy, 5U).empty(),
+          "empty book should have no bid depth");
+  require(engine.depth(Side::Sell, 5U).empty(),
+          "empty book should have no ask depth");
+  require(engine.depth(Side::Buy, 0U).empty(),
+          "zero requested levels should return empty depth");
+  require(engine.snapshot().orders.empty(),
+          "empty book should have an empty snapshot");
+}
+
+void depth_aggregates_and_orders_top_price_levels() {
+  MatchingEngine engine;
+  require(engine
+              .submit_limit(OrderRequest{.id = OrderId{1},
+                                         .side = Side::Buy,
+                                         .price = Price{100},
+                                         .quantity = Quantity{2}})
+              .ok(),
+          "first best bid should rest");
+  require(engine
+              .submit_limit(OrderRequest{.id = OrderId{2},
+                                         .side = Side::Buy,
+                                         .price = Price{100},
+                                         .quantity = Quantity{3}})
+              .ok(),
+          "second best bid should rest");
+  require(engine
+              .submit_limit(OrderRequest{.id = OrderId{3},
+                                         .side = Side::Buy,
+                                         .price = Price{99},
+                                         .quantity = Quantity{4}})
+              .ok(),
+          "second bid level should rest");
+  require(engine
+              .submit_limit(OrderRequest{.id = OrderId{4},
+                                         .side = Side::Buy,
+                                         .price = Price{98},
+                                         .quantity = Quantity{5}})
+              .ok(),
+          "third bid level should rest");
+  require(engine
+              .submit_limit(OrderRequest{.id = OrderId{5},
+                                         .side = Side::Sell,
+                                         .price = Price{105},
+                                         .quantity = Quantity{6}})
+              .ok(),
+          "first best ask should rest");
+  require(engine
+              .submit_limit(OrderRequest{.id = OrderId{6},
+                                         .side = Side::Sell,
+                                         .price = Price{105},
+                                         .quantity = Quantity{7}})
+              .ok(),
+          "second best ask should rest");
+  require(engine
+              .submit_limit(OrderRequest{.id = OrderId{7},
+                                         .side = Side::Sell,
+                                         .price = Price{106},
+                                         .quantity = Quantity{8}})
+              .ok(),
+          "second ask level should rest");
+
+  const auto bid_depth = engine.depth(Side::Buy, 2U);
+  require(bid_depth.size() == 2U, "bid depth should honor the level limit");
+  require_depth_level(bid_depth.at(0), Price{100}, Quantity{5});
+  require_depth_level(bid_depth.at(1), Price{99}, Quantity{4});
+
+  const auto ask_depth = engine.depth(Side::Sell, 10U);
+  require(ask_depth.size() == 2U,
+          "ask depth should return all available levels");
+  require_depth_level(ask_depth.at(0), Price{105}, Quantity{13});
+  require_depth_level(ask_depth.at(1), Price{106}, Quantity{8});
+
+  require(engine.depth(Side::Sell, 0U).empty(),
+          "zero-level ask depth should be empty");
+}
+
+void depth_rejects_aggregate_quantity_overflow() {
+  MatchingEngine engine;
+  require(engine
+              .submit_limit(OrderRequest{
+                  .id = OrderId{1},
+                  .side = Side::Buy,
+                  .price = Price{100},
+                  .quantity = std::numeric_limits<Quantity>::max()})
+              .ok(),
+          "maximum-quantity bid should rest");
+  require(engine
+              .submit_limit(OrderRequest{.id = OrderId{2},
+                                         .side = Side::Buy,
+                                         .price = Price{100},
+                                         .quantity = Quantity{1}})
+              .ok(),
+          "second same-price bid should rest");
+
+  bool overflow_detected = false;
+  try {
+    (void)engine.depth(Side::Buy, 1U);
+  } catch (const std::overflow_error &) {
+    overflow_detected = true;
+  }
+
+  require(overflow_detected,
+          "depth should reject an unrepresentable aggregate quantity");
+  require(engine.snapshot().orders.size() == 2U,
+          "failed depth query should not mutate the book");
+}
+
+void snapshot_is_deterministic_in_side_price_fifo_order() {
+  MatchingEngine engine;
+  require(engine
+              .submit_limit(OrderRequest{.id = OrderId{1},
+                                         .side = Side::Sell,
+                                         .price = Price{106},
+                                         .quantity = Quantity{1}})
+              .ok(),
+          "first ask should rest");
+  require(engine
+              .submit_limit(OrderRequest{.id = OrderId{2},
+                                         .side = Side::Buy,
+                                         .price = Price{99},
+                                         .quantity = Quantity{2}})
+              .ok(),
+          "first bid should rest");
+  require(engine
+              .submit_limit(OrderRequest{.id = OrderId{3},
+                                         .side = Side::Sell,
+                                         .price = Price{105},
+                                         .quantity = Quantity{3}})
+              .ok(),
+          "best ask should rest");
+  require(engine
+              .submit_limit(OrderRequest{.id = OrderId{4},
+                                         .side = Side::Buy,
+                                         .price = Price{100},
+                                         .quantity = Quantity{4}})
+              .ok(),
+          "best bid should rest");
+  require(engine
+              .submit_limit(OrderRequest{.id = OrderId{5},
+                                         .side = Side::Buy,
+                                         .price = Price{100},
+                                         .quantity = Quantity{5}})
+              .ok(),
+          "second best-price bid should rest");
+  require(engine
+              .submit_limit(OrderRequest{.id = OrderId{6},
+                                         .side = Side::Sell,
+                                         .price = Price{105},
+                                         .quantity = Quantity{6}})
+              .ok(),
+          "second best-price ask should rest");
+
+  const BookSnapshot first = engine.snapshot();
+  const BookSnapshot second = engine.snapshot();
+
+  require(first.orders.size() == 6U,
+          "snapshot should contain every resting order");
+  require(second.orders.size() == first.orders.size(),
+          "repeated snapshot should have the same size");
+  require_snapshot_order(first.orders.at(0), OrderId{4}, Side::Buy, Price{100},
+                         Quantity{4}, SequenceNumber{3});
+  require_snapshot_order(first.orders.at(1), OrderId{5}, Side::Buy, Price{100},
+                         Quantity{5}, SequenceNumber{4});
+  require_snapshot_order(first.orders.at(2), OrderId{2}, Side::Buy, Price{99},
+                         Quantity{2}, SequenceNumber{1});
+  require_snapshot_order(first.orders.at(3), OrderId{3}, Side::Sell, Price{105},
+                         Quantity{3}, SequenceNumber{2});
+  require_snapshot_order(first.orders.at(4), OrderId{6}, Side::Sell, Price{105},
+                         Quantity{6}, SequenceNumber{5});
+  require_snapshot_order(first.orders.at(5), OrderId{1}, Side::Sell, Price{106},
+                         Quantity{1}, SequenceNumber{0});
+
+  for (std::size_t index = 0; index < first.orders.size(); ++index) {
+    const SnapshotOrder &expected = first.orders.at(index);
+    require_snapshot_order(second.orders.at(index), expected.id, expected.side,
+                           expected.price, expected.quantity,
+                           expected.sequence);
+  }
+}
+
+void snapshot_tracks_lifecycle_and_sequence_rules() {
+  MatchingEngine engine;
+  require(engine
+              .submit_limit(OrderRequest{.id = OrderId{1},
+                                         .side = Side::Sell,
+                                         .price = Price{105},
+                                         .quantity = Quantity{5}})
+              .ok(),
+          "first ask should rest");
+  require(engine
+              .submit_limit(OrderRequest{.id = OrderId{2},
+                                         .side = Side::Sell,
+                                         .price = Price{105},
+                                         .quantity = Quantity{3}})
+              .ok(),
+          "second ask should rest");
+
+  const auto market_result = engine.submit_market(MarketOrderRequest{
+      .id = OrderId{90}, .side = Side::Buy, .quantity = Quantity{2}});
+  require(market_result.ok(), "market order should partially fill first ask");
+  require(engine.cancel(OrderId{2}) == ErrorCode::None,
+          "second ask should cancel");
+  require(engine
+              .submit_limit(OrderRequest{.id = OrderId{3},
+                                         .side = Side::Buy,
+                                         .price = Price{100},
+                                         .quantity = Quantity{4}})
+              .ok(),
+          "bid should rest");
+
+  const auto reduce_result = engine.replace(ReplaceRequest{
+      .id = OrderId{3}, .new_price = Price{100}, .new_quantity = Quantity{2}});
+  require(reduce_result.ok(), "same-price reduction should succeed");
+
+  const auto reduced_snapshot = engine.snapshot();
+  require(reduced_snapshot.orders.size() == 2U,
+          "snapshot should omit market and cancelled orders");
+  require_snapshot_order(reduced_snapshot.orders.at(0), OrderId{3}, Side::Buy,
+                         Price{100}, Quantity{2}, SequenceNumber{2});
+  require_snapshot_order(reduced_snapshot.orders.at(1), OrderId{1}, Side::Sell,
+                         Price{105}, Quantity{3}, SequenceNumber{0});
+
+  const auto reprice_result = engine.replace(ReplaceRequest{
+      .id = OrderId{3}, .new_price = Price{101}, .new_quantity = Quantity{2}});
+  require(reprice_result.ok(), "non-crossing price change should succeed");
+
+  const auto repriced_snapshot = engine.snapshot();
+  require_snapshot_order(repriced_snapshot.orders.at(0), OrderId{3}, Side::Buy,
+                         Price{101}, Quantity{2}, SequenceNumber{3});
+  require_snapshot_order(repriced_snapshot.orders.at(1), OrderId{1}, Side::Sell,
+                         Price{105}, Quantity{3}, SequenceNumber{0});
+
+  const auto bid_depth = engine.depth(Side::Buy, 1U);
+  const auto ask_depth = engine.depth(Side::Sell, 1U);
+  require_depth_level(bid_depth.at(0), Price{101}, Quantity{2});
+  require_depth_level(ask_depth.at(0), Price{105}, Quantity{3});
+  require_not_crossed(engine);
+}
+
 void add_three_same_price_asks(MatchingEngine &engine) {
   for (const OrderId id : {OrderId{1}, OrderId{2}, OrderId{3}}) {
     require(engine
@@ -948,6 +1218,327 @@ void invalid_and_unknown_replacements_do_not_mutate_book() {
                 Quantity{5});
 }
 
+struct ExpectedOrderState {
+  Side side;
+  Price price;
+  Quantity quantity;
+  SequenceNumber sequence;
+};
+
+using ExpectedOrders = std::unordered_map<OrderId, ExpectedOrderState>;
+
+[[noreturn]] void
+fail_randomized_test(std::uint32_t seed, std::size_t step,
+                     const std::vector<std::string> &operations,
+                     std::string_view message) {
+  std::ostringstream output;
+  output << message << "\nseed=" << seed << " step=" << step << "\noperations:";
+  for (std::size_t index = 0; index < operations.size(); ++index) {
+    output << "\n  " << index << ": " << operations.at(index);
+  }
+  throw std::runtime_error(output.str());
+}
+
+void require_randomized(bool condition, std::uint32_t seed, std::size_t step,
+                        const std::vector<std::string> &operations,
+                        std::string_view message) {
+  if (!condition) {
+    fail_randomized_test(seed, step, operations, message);
+  }
+}
+
+Quantity apply_randomized_trades(const std::vector<Trade> &trades,
+                                 OrderId aggressor_id, Side aggressor_side,
+                                 Quantity incoming_quantity,
+                                 ExpectedOrders &orders, std::uint32_t seed,
+                                 std::size_t step,
+                                 const std::vector<std::string> &operations) {
+  Quantity executed{};
+
+  for (const Trade &trade : trades) {
+    require_randomized(trade.aggressor_id == aggressor_id, seed, step,
+                       operations, "trade has wrong aggressor ID");
+    require_randomized(trade.quantity > Quantity{0}, seed, step, operations,
+                       "trade has zero quantity");
+    require_randomized(trade.quantity <= incoming_quantity - executed, seed,
+                       step, operations,
+                       "executed quantity exceeds incoming quantity");
+
+    const auto resting = orders.find(trade.resting_id);
+    require_randomized(resting != orders.end(), seed, step, operations,
+                       "trade references unknown resting order");
+    require_randomized(resting->second.side != aggressor_side, seed, step,
+                       operations, "trade matches the same side");
+    require_randomized(resting->second.price == trade.price, seed, step,
+                       operations, "trade does not use resting price");
+    require_randomized(trade.quantity <= resting->second.quantity, seed, step,
+                       operations, "trade exceeds resting order quantity");
+
+    executed += trade.quantity;
+    resting->second.quantity -= trade.quantity;
+    if (resting->second.quantity == Quantity{0}) {
+      orders.erase(resting);
+    }
+  }
+
+  return executed;
+}
+
+void verify_randomized_state(MatchingEngine &engine,
+                             const ExpectedOrders &orders, OrderId maximum_id,
+                             std::uint32_t seed, std::size_t step,
+                             const std::vector<std::string> &operations) {
+  struct ExpectedSnapshotOrder {
+    OrderId id;
+    ExpectedOrderState order;
+  };
+
+  std::vector<ExpectedSnapshotOrder> expected_snapshot;
+  expected_snapshot.reserve(orders.size());
+  for (const auto &[id, order] : orders) {
+    require_randomized(order.quantity > Quantity{0}, seed, step, operations,
+                       "reference model contains zero quantity");
+    expected_snapshot.push_back(
+        ExpectedSnapshotOrder{.id = id, .order = order});
+  }
+
+  std::sort(expected_snapshot.begin(), expected_snapshot.end(),
+            [](const ExpectedSnapshotOrder &left,
+               const ExpectedSnapshotOrder &right) {
+              if (left.order.side != right.order.side) {
+                return left.order.side == Side::Buy;
+              }
+              if (left.order.price != right.order.price) {
+                if (left.order.side == Side::Buy) {
+                  return left.order.price > right.order.price;
+                }
+                return left.order.price < right.order.price;
+              }
+              return left.order.sequence < right.order.sequence;
+            });
+
+  const auto compare_snapshot = [&](const BookSnapshot &snapshot,
+                                    std::string_view size_error,
+                                    std::string_view value_error) {
+    require_randomized(snapshot.orders.size() == expected_snapshot.size(), seed,
+                       step, operations, size_error);
+    for (std::size_t index = 0; index < snapshot.orders.size(); ++index) {
+      const SnapshotOrder &actual = snapshot.orders.at(index);
+      const ExpectedSnapshotOrder &expected = expected_snapshot.at(index);
+      require_randomized(actual.id == expected.id &&
+                             actual.side == expected.order.side &&
+                             actual.price == expected.order.price &&
+                             actual.quantity == expected.order.quantity &&
+                             actual.sequence == expected.order.sequence,
+                         seed, step, operations, value_error);
+    }
+  };
+
+  compare_snapshot(engine.snapshot(), "snapshot size disagrees with model",
+                   "snapshot content or order disagrees with model");
+
+  std::map<Price, Quantity, std::greater<Price>> expected_bids;
+  std::map<Price, Quantity, std::less<Price>> expected_asks;
+  for (const auto &[id, order] : orders) {
+    (void)id;
+    if (order.side == Side::Buy) {
+      expected_bids[order.price] += order.quantity;
+    } else {
+      expected_asks[order.price] += order.quantity;
+    }
+  }
+
+  const auto bid_depth = engine.depth(Side::Buy, expected_bids.size() + 1U);
+  require_randomized(bid_depth.size() == expected_bids.size(), seed, step,
+                     operations, "bid depth level count disagrees with model");
+  std::size_t depth_index = 0;
+  for (const auto &[price, quantity] : expected_bids) {
+    require_randomized(bid_depth.at(depth_index).price == price &&
+                           bid_depth.at(depth_index).quantity == quantity,
+                       seed, step, operations,
+                       "bid depth disagrees with model");
+    ++depth_index;
+  }
+
+  const auto ask_depth = engine.depth(Side::Sell, expected_asks.size() + 1U);
+  require_randomized(ask_depth.size() == expected_asks.size(), seed, step,
+                     operations, "ask depth level count disagrees with model");
+  depth_index = 0;
+  for (const auto &[price, quantity] : expected_asks) {
+    require_randomized(ask_depth.at(depth_index).price == price &&
+                           ask_depth.at(depth_index).quantity == quantity,
+                       seed, step, operations,
+                       "ask depth disagrees with model");
+    ++depth_index;
+  }
+
+  const auto best_bid = engine.best_bid();
+  const auto best_ask = engine.best_ask();
+  require_randomized(
+      best_bid == (expected_bids.empty()
+                       ? std::optional<Price>{}
+                       : std::optional<Price>{expected_bids.begin()->first}),
+      seed, step, operations, "best bid disagrees with model");
+  require_randomized(
+      best_ask == (expected_asks.empty()
+                       ? std::optional<Price>{}
+                       : std::optional<Price>{expected_asks.begin()->first}),
+      seed, step, operations, "best ask disagrees with model");
+  if (best_bid.has_value() && best_ask.has_value()) {
+    require_randomized(*best_bid < *best_ask, seed, step, operations,
+                       "book is crossed");
+  }
+
+  for (OrderId id = OrderId{1}; id <= maximum_id; ++id) {
+    const auto expected = orders.find(id);
+    if (expected == orders.end()) {
+      const auto result = engine.replace(ReplaceRequest{
+          .id = id, .new_price = Price{100}, .new_quantity = Quantity{1}});
+      require_randomized(result.error == ErrorCode::UnknownOrderId, seed, step,
+                         operations,
+                         "inactive ID still appears in order index");
+      continue;
+    }
+
+    const auto result = engine.replace(
+        ReplaceRequest{.id = id,
+                       .new_price = expected->second.price,
+                       .new_quantity = expected->second.quantity});
+    require_randomized(result.ok() && result.trades.empty(), seed, step,
+                       operations,
+                       "active order is missing or stale in order index");
+  }
+
+  compare_snapshot(engine.snapshot(), "index checks changed snapshot size",
+                   "index checks changed snapshot content");
+}
+
+void deterministic_randomized_events_preserve_invariants() {
+  constexpr std::uint32_t seed = 0x00C0FFEEU;
+  constexpr std::size_t event_count = 400U;
+  constexpr OrderId maximum_id = OrderId{32};
+
+  std::mt19937 generator{seed};
+  MatchingEngine engine;
+  ExpectedOrders orders;
+  SequenceNumber next_sequence{};
+  std::vector<std::string> operations;
+  operations.reserve(event_count);
+
+  for (std::size_t step = 0; step < event_count; ++step) {
+    const std::uint32_t operation = generator() % 4U;
+    const OrderId id =
+        OrderId{1} + static_cast<OrderId>(generator() % maximum_id);
+    const Side side = generator() % 2U == 0U ? Side::Buy : Side::Sell;
+    const Price price =
+        Price{95} + static_cast<Price>(generator() % std::uint32_t{11});
+    const Quantity quantity =
+        Quantity{1} + static_cast<Quantity>(generator() % std::uint32_t{10});
+
+    std::ostringstream event;
+    if (operation == 0U) {
+      event << "limit id=" << id
+            << " side=" << (side == Side::Buy ? "buy" : "sell")
+            << " price=" << price << " quantity=" << quantity;
+      operations.push_back(event.str());
+
+      const bool duplicate = orders.contains(id);
+      const auto result = engine.submit_limit(OrderRequest{
+          .id = id, .side = side, .price = price, .quantity = quantity});
+      if (duplicate) {
+        require_randomized(
+            result.error == ErrorCode::DuplicateOrderId &&
+                result.trades.empty(),
+            seed, step, operations,
+            "duplicate limit order did not fail without mutation");
+      } else {
+        require_randomized(result.ok(), seed, step, operations,
+                           "valid limit order failed");
+        const Quantity executed = apply_randomized_trades(
+            result.trades, id, side, quantity, orders, seed, step, operations);
+        const Quantity remainder = quantity - executed;
+        if (remainder > Quantity{0}) {
+          orders.emplace(id, ExpectedOrderState{.side = side,
+                                                .price = price,
+                                                .quantity = remainder,
+                                                .sequence = next_sequence});
+          ++next_sequence;
+        }
+      }
+    } else if (operation == 1U) {
+      event << "market id=" << id
+            << " side=" << (side == Side::Buy ? "buy" : "sell")
+            << " quantity=" << quantity;
+      operations.push_back(event.str());
+
+      const bool duplicate = orders.contains(id);
+      const auto result = engine.submit_market(
+          MarketOrderRequest{.id = id, .side = side, .quantity = quantity});
+      if (duplicate) {
+        require_randomized(
+            result.error == ErrorCode::DuplicateOrderId &&
+                result.trades.empty(),
+            seed, step, operations,
+            "duplicate market order did not fail without mutation");
+      } else {
+        require_randomized(result.ok(), seed, step, operations,
+                           "valid market order failed");
+        (void)apply_randomized_trades(result.trades, id, side, quantity, orders,
+                                      seed, step, operations);
+      }
+    } else if (operation == 2U) {
+      event << "cancel id=" << id;
+      operations.push_back(event.str());
+
+      const bool active = orders.contains(id);
+      const ErrorCode error = engine.cancel(id);
+      require_randomized(
+          error == (active ? ErrorCode::None : ErrorCode::UnknownOrderId), seed,
+          step, operations, "cancel result disagrees with model");
+      if (active) {
+        orders.erase(id);
+      }
+    } else {
+      event << "replace id=" << id << " price=" << price
+            << " quantity=" << quantity;
+      operations.push_back(event.str());
+
+      const auto existing = orders.find(id);
+      const auto result = engine.replace(ReplaceRequest{
+          .id = id, .new_price = price, .new_quantity = quantity});
+      if (existing == orders.end()) {
+        require_randomized(result.error == ErrorCode::UnknownOrderId, seed,
+                           step, operations,
+                           "unknown replacement did not return error");
+      } else {
+        require_randomized(result.ok(), seed, step, operations,
+                           "valid replacement failed");
+        const ExpectedOrderState original = existing->second;
+        if (price == original.price && quantity <= original.quantity) {
+          require_randomized(result.trades.empty(), seed, step, operations,
+                             "priority-preserving replacement traded");
+          existing->second.quantity = quantity;
+        } else {
+          orders.erase(existing);
+          const Quantity executed =
+              apply_randomized_trades(result.trades, id, original.side,
+                                      quantity, orders, seed, step, operations);
+          const Quantity remainder = quantity - executed;
+          if (remainder > Quantity{0}) {
+            orders.emplace(id, ExpectedOrderState{.side = original.side,
+                                                  .price = price,
+                                                  .quantity = remainder,
+                                                  .sequence = next_sequence});
+            ++next_sequence;
+          }
+        }
+      }
+    }
+
+    verify_randomized_state(engine, orders, maximum_id, seed, step, operations);
+  }
+}
+
 void invalid_submit_paths_return_validation_errors() {
   MatchingEngine engine;
   const OrderRequest invalid_limit{.id = OrderId{1},
@@ -1016,6 +1607,16 @@ int main() {
        market_order_on_empty_book_is_accepted_without_resting},
       {"duplicate active ID market order is rejected without mutation",
        duplicate_active_id_market_order_is_rejected_without_mutation},
+      {"empty book has empty depth and snapshot",
+       empty_book_has_empty_depth_and_snapshot},
+      {"depth aggregates and orders top price levels",
+       depth_aggregates_and_orders_top_price_levels},
+      {"depth rejects aggregate quantity overflow",
+       depth_rejects_aggregate_quantity_overflow},
+      {"snapshot is deterministic in side-price-FIFO order",
+       snapshot_is_deterministic_in_side_price_fifo_order},
+      {"snapshot tracks lifecycle and sequence rules",
+       snapshot_tracks_lifecycle_and_sequence_rules},
       {"cancel removes head, middle, and tail orders",
        cancel_removes_head_middle_and_tail_orders},
       {"cancelling last order removes level and index entry",
@@ -1034,6 +1635,8 @@ int main() {
        invalid_and_unknown_replacements_do_not_mutate_book},
       {"invalid submit paths return validation errors",
        invalid_submit_paths_return_validation_errors},
+      {"deterministic randomized events preserve invariants",
+       deterministic_randomized_events_preserve_invariants},
   };
 
   for (const auto &[name, test] : tests) {
