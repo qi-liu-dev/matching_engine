@@ -43,8 +43,7 @@ enum class ErrorCode {
   DuplicateOrderId,
   UnknownOrderId,
   InvalidPrice,
-  InvalidQuantity,
-  UnsupportedOperation
+  InvalidQuantity
 };
 
 struct SubmitResult {

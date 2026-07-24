@@ -56,6 +56,8 @@ private:
 
   [[nodiscard]] SubmitResult submit_buy_limit(OrderRequest request);
   [[nodiscard]] SubmitResult submit_sell_limit(OrderRequest request);
+  [[nodiscard]] SubmitResult submit_buy_market(MarketOrderRequest request);
+  [[nodiscard]] SubmitResult submit_sell_market(MarketOrderRequest request);
   void rest_order(OrderRequest request);
 
   BidLevels bids_{};

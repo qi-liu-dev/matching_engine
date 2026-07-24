@@ -3,9 +3,9 @@
 ## Status
 
 This plan defines the implementation path for an educational C++20 limit order
-book and matching engine. Milestone 2 has added the limit-order matching core.
-Cancellation, replacement, market orders, depth, snapshots, and benchmarks are
-not implemented yet.
+book and matching engine. Milestone 4A has added market orders after
+cancellation and replacement. Depth, snapshots, and benchmarks are not
+implemented yet.
 
 Milestone status values:
 
@@ -161,8 +161,8 @@ Benefits:
 - FIFO is easy to explain.
 - `std::list` iterators remain valid when other orders in the same level are
   inserted or erased.
-- Arbitrary cancel by order ID is average O(1) after index lookup, plus O(log P)
-  if the price level becomes empty and must be erased.
+- Arbitrary cancel by order ID uses an average O(1) index lookup, an O(log P)
+  price-level lookup, and an O(1) list erase.
 
 Costs:
 
@@ -231,11 +231,11 @@ Expected operation costs:
 
 - Submit non-marketable limit order: O(log P) to find/create the price level,
   average O(1) to index by order ID.
-- Submit marketable limit order: O(K log P) worst case due to possible empty
-  price-level erasures, plus O(log P) to rest any remainder.
-- Submit market order: O(K log P) worst case. No remainder rests.
-- Cancel: average O(1) order lookup, O(1) list erase, and O(log P) only if an
-  empty price level is removed.
+- Submit marketable limit order: expected O(K), plus O(log P) to rest any
+  remainder.
+- Submit market order: expected O(K). No remainder rests.
+- Cancel: average O(1) order lookup, O(log P) price-level lookup, and O(1) list
+  erase.
 - Replace reducing quantity at same price: average O(1) lookup and O(1)
   mutation.
 - Replace changing price or increasing quantity: cancel plus submit semantics.
@@ -243,6 +243,15 @@ Expected operation costs:
 - Top-N depth: O(min(L, P) + orders visited if aggregation is not maintained).
   A later measured optimization may maintain level aggregate quantity.
 - Snapshot: O(N).
+
+Plan correction (2026-07-24): the baseline order index stores side and price,
+not a price-level map iterator, so cancellation always performs an O(log P)
+price-level lookup. The previous text incorrectly applied that cost only when
+an empty level was removed.
+
+Plan correction (2026-07-24): matching erases empty price levels through known
+map iterators, which is amortized O(1). The previous O(K log P) estimate
+overstated expected limit and market matching costs.
 
 ## Matching semantics
 
@@ -463,7 +472,7 @@ Acceptance criteria:
 
 ### Milestone 3: Cancellation and replacement
 
-Status: Planned.
+Status: Complete.
 
 Scope:
 
@@ -486,7 +495,7 @@ Acceptance criteria:
 
 ### Milestone 4A: Market orders
 
-Status: Planned.
+Status: Complete.
 
 Scope:
 
@@ -500,9 +509,13 @@ Acceptance criteria:
 - Tests cover market sell consuming bids.
 - Tests cover market orders matching multiple levels.
 - Tests cover partial market fills with empty opposite side.
-- Tests prove market orders do not appear in best price, depth, snapshot, or
-  order index.
+- Tests prove market orders do not appear in best price or the order index.
 - Debug build, CTest, and sanitizers pass.
+
+Plan correction (2026-07-24): depth and snapshot queries are implemented in
+Milestone 4B, so proving that they omit market orders is deferred to that
+milestone. Milestone 4A still proves directly that market orders never rest or
+enter the active-order index.
 
 ### Milestone 4B: Depth, snapshots, and randomized invariants
 
@@ -520,6 +533,7 @@ Acceptance criteria:
 - Depth returns side-specific ordering.
 - Empty-book depth and snapshot behavior is tested.
 - Snapshot order is deterministic and documented.
+- Depth and snapshots do not contain market orders.
 - Randomized tests record the seed and operation sequence on failure.
 - Invariant tests check index/container consistency, no zero active quantities,
   no empty levels, and no crossed book.

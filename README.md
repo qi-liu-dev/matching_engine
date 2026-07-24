@@ -10,7 +10,7 @@ trading platform.
 
 ## Current status
 
-Milestone 2 is the limit-order matching core:
+Milestone 4A adds market orders to the matching core:
 
 - CMake project configuration
 - project-only compiler warnings
@@ -22,10 +22,18 @@ Milestone 2 is the limit-order matching core:
 - partial fills
 - deterministic trade events
 - best bid and best ask queries
+- cancellation by active order ID
+- same-price quantity reductions that preserve priority
+- quantity increases and price changes that lose priority
+- price-changing replacements that may match immediately
+- explicit errors for unknown cancellations and replacements
+- market buys and sells with price-time priority
+- cancellation of unfilled market-order remainders
+- duplicate active ID rejection for market orders
 - CTest-based tests
 
-Cancellation, replacement, market orders, depth, snapshots, parsing, and
-benchmarks are intentionally deferred to later milestones.
+Depth, snapshots, parsing, and benchmarks are intentionally deferred to later
+milestones.
 
 ## Build and test
 
