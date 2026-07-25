@@ -98,15 +98,61 @@ SubmitResult MatchingEngine::replace(ReplaceRequest request) {
     return {};
   }
 
-  const ErrorCode cancel_error = cancel(request.id);
-  if (cancel_error != ErrorCode::None) {
-    return SubmitResult{.error = cancel_error, .trades = {}};
+  const MatchPlan plan =
+      side == Side::Buy
+          ? plan_buy_matches(request.new_quantity, request.new_price)
+          : plan_sell_matches(request.new_quantity, request.new_price);
+  SubmitResult result{};
+  // Complete potentially throwing allocations before touching either book side.
+  result.trades.reserve(plan.trade_count);
+
+  if (plan.remaining_quantity > Quantity{0}) {
+    if (side == Side::Buy) {
+      bids_.try_emplace(request.new_price);
+    } else {
+      asks_.try_emplace(request.new_price);
+    }
   }
 
-  return submit_limit(OrderRequest{.id = request.id,
-                                   .side = side,
-                                   .price = request.new_price,
-                                   .quantity = request.new_quantity});
+  Quantity remaining_quantity = request.new_quantity;
+  if (side == Side::Buy) {
+    match_buy(request.id, remaining_quantity, request.new_price, result.trades);
+  } else {
+    match_sell(request.id, remaining_quantity, request.new_price,
+               result.trades);
+  }
+
+  if (remaining_quantity == Quantity{0}) {
+    (void)cancel(request.id);
+    return result;
+  }
+
+  if (side == Side::Buy) {
+    const auto old_level = bids_.find(order.price);
+    const auto new_level = bids_.find(request.new_price);
+    new_level->second.orders.splice(new_level->second.orders.end(),
+                                    old_level->second.orders,
+                                    location->second.order);
+    if (old_level != new_level && old_level->second.orders.empty()) {
+      bids_.erase(old_level);
+    }
+  } else {
+    const auto old_level = asks_.find(order.price);
+    const auto new_level = asks_.find(request.new_price);
+    new_level->second.orders.splice(new_level->second.orders.end(),
+                                    old_level->second.orders,
+                                    location->second.order);
+    if (old_level != new_level && old_level->second.orders.empty()) {
+      asks_.erase(old_level);
+    }
+  }
+
+  order.price = request.new_price;
+  order.quantity = remaining_quantity;
+  order.sequence = next_sequence_;
+  location->second.price = request.new_price;
+  ++next_sequence_;
+  return result;
 }
 
 std::optional<Price> MatchingEngine::best_bid() const noexcept {
@@ -186,105 +232,119 @@ BookSnapshot MatchingEngine::snapshot() const {
 }
 
 SubmitResult MatchingEngine::submit_buy_limit(OrderRequest request) {
+  const MatchPlan plan = plan_buy_matches(request.quantity, request.price);
   SubmitResult result{};
+  // Stage the final remainder before matching so allocation failure is atomic.
+  result.trades.reserve(plan.trade_count);
 
-  while (request.quantity > Quantity{0} && !asks_.empty()) {
-    auto best_ask = asks_.begin();
-    if (best_ask->first > request.price) {
-      break;
-    }
-
-    auto &resting_orders = best_ask->second.orders;
-    while (request.quantity > Quantity{0} && !resting_orders.empty()) {
-      auto resting = resting_orders.begin();
-      const Quantity trade_quantity =
-          std::min(request.quantity, resting->quantity);
-
-      result.trades.push_back(Trade{.aggressor_id = request.id,
-                                    .resting_id = resting->id,
-                                    .price = resting->price,
-                                    .quantity = trade_quantity});
-
-      request.quantity -= trade_quantity;
-      resting->quantity -= trade_quantity;
-
-      if (resting->quantity == Quantity{0}) {
-        order_index_.erase(resting->id);
-        resting_orders.erase(resting);
-      }
-    }
-
-    if (resting_orders.empty()) {
-      asks_.erase(best_ask);
-    }
+  if (plan.remaining_quantity > Quantity{0}) {
+    rest_order(OrderRequest{.id = request.id,
+                            .side = request.side,
+                            .price = request.price,
+                            .quantity = plan.remaining_quantity});
   }
 
-  if (request.quantity > Quantity{0}) {
-    rest_order(request);
-  }
-
+  match_buy(request.id, request.quantity, request.price, result.trades);
   return result;
 }
 
 SubmitResult MatchingEngine::submit_sell_limit(OrderRequest request) {
+  const MatchPlan plan = plan_sell_matches(request.quantity, request.price);
   SubmitResult result{};
+  // Stage the final remainder before matching so allocation failure is atomic.
+  result.trades.reserve(plan.trade_count);
 
-  while (request.quantity > Quantity{0} && !bids_.empty()) {
-    auto best_bid = bids_.begin();
-    if (best_bid->first < request.price) {
-      break;
-    }
-
-    auto &resting_orders = best_bid->second.orders;
-    while (request.quantity > Quantity{0} && !resting_orders.empty()) {
-      auto resting = resting_orders.begin();
-      const Quantity trade_quantity =
-          std::min(request.quantity, resting->quantity);
-
-      result.trades.push_back(Trade{.aggressor_id = request.id,
-                                    .resting_id = resting->id,
-                                    .price = resting->price,
-                                    .quantity = trade_quantity});
-
-      request.quantity -= trade_quantity;
-      resting->quantity -= trade_quantity;
-
-      if (resting->quantity == Quantity{0}) {
-        order_index_.erase(resting->id);
-        resting_orders.erase(resting);
-      }
-    }
-
-    if (resting_orders.empty()) {
-      bids_.erase(best_bid);
-    }
+  if (plan.remaining_quantity > Quantity{0}) {
+    rest_order(OrderRequest{.id = request.id,
+                            .side = request.side,
+                            .price = request.price,
+                            .quantity = plan.remaining_quantity});
   }
 
-  if (request.quantity > Quantity{0}) {
-    rest_order(request);
-  }
-
+  match_sell(request.id, request.quantity, request.price, result.trades);
   return result;
 }
 
 SubmitResult MatchingEngine::submit_buy_market(MarketOrderRequest request) {
+  const MatchPlan plan = plan_buy_matches(request.quantity, std::nullopt);
   SubmitResult result{};
+  result.trades.reserve(plan.trade_count);
 
-  while (request.quantity > Quantity{0} && !asks_.empty()) {
+  match_buy(request.id, request.quantity, std::nullopt, result.trades);
+  return result;
+}
+
+SubmitResult MatchingEngine::submit_sell_market(MarketOrderRequest request) {
+  const MatchPlan plan = plan_sell_matches(request.quantity, std::nullopt);
+  SubmitResult result{};
+  result.trades.reserve(plan.trade_count);
+
+  match_sell(request.id, request.quantity, std::nullopt, result.trades);
+  return result;
+}
+
+MatchingEngine::MatchPlan MatchingEngine::plan_buy_matches(
+    Quantity quantity, std::optional<Price> limit_price) const noexcept {
+  std::size_t trade_count{};
+  for (const auto &[price, level] : asks_) {
+    if (limit_price.has_value() && price > *limit_price) {
+      break;
+    }
+
+    for (const RestingOrder &order : level.orders) {
+      ++trade_count;
+      quantity -= std::min(quantity, order.quantity);
+      if (quantity == Quantity{0}) {
+        return MatchPlan{.trade_count = trade_count,
+                         .remaining_quantity = Quantity{0}};
+      }
+    }
+  }
+
+  return MatchPlan{.trade_count = trade_count, .remaining_quantity = quantity};
+}
+
+MatchingEngine::MatchPlan MatchingEngine::plan_sell_matches(
+    Quantity quantity, std::optional<Price> limit_price) const noexcept {
+  std::size_t trade_count{};
+  for (const auto &[price, level] : bids_) {
+    if (limit_price.has_value() && price < *limit_price) {
+      break;
+    }
+
+    for (const RestingOrder &order : level.orders) {
+      ++trade_count;
+      quantity -= std::min(quantity, order.quantity);
+      if (quantity == Quantity{0}) {
+        return MatchPlan{.trade_count = trade_count,
+                         .remaining_quantity = Quantity{0}};
+      }
+    }
+  }
+
+  return MatchPlan{.trade_count = trade_count, .remaining_quantity = quantity};
+}
+
+void MatchingEngine::match_buy(OrderId aggressor_id, Quantity &quantity,
+                               std::optional<Price> limit_price,
+                               std::vector<Trade> &trades) {
+  while (quantity > Quantity{0} && !asks_.empty()) {
     auto best_ask = asks_.begin();
+    if (limit_price.has_value() && best_ask->first > *limit_price) {
+      break;
+    }
+
     auto &resting_orders = best_ask->second.orders;
-
-    while (request.quantity > Quantity{0} && !resting_orders.empty()) {
+    while (quantity > Quantity{0} && !resting_orders.empty()) {
       auto resting = resting_orders.begin();
-      const Quantity trade_quantity =
-          std::min(request.quantity, resting->quantity);
+      const Quantity trade_quantity = std::min(quantity, resting->quantity);
 
-      result.trades.push_back(Trade{.aggressor_id = request.id,
-                                    .resting_id = resting->id,
-                                    .price = resting->price,
-                                    .quantity = trade_quantity});
+      trades.push_back(Trade{.aggressor_id = aggressor_id,
+                             .resting_id = resting->id,
+                             .price = resting->price,
+                             .quantity = trade_quantity});
 
-      request.quantity -= trade_quantity;
+      quantity -= trade_quantity;
       resting->quantity -= trade_quantity;
 
       if (resting->quantity == Quantity{0}) {
@@ -297,28 +357,28 @@ SubmitResult MatchingEngine::submit_buy_market(MarketOrderRequest request) {
       asks_.erase(best_ask);
     }
   }
-
-  return result;
 }
 
-SubmitResult MatchingEngine::submit_sell_market(MarketOrderRequest request) {
-  SubmitResult result{};
-
-  while (request.quantity > Quantity{0} && !bids_.empty()) {
+void MatchingEngine::match_sell(OrderId aggressor_id, Quantity &quantity,
+                                std::optional<Price> limit_price,
+                                std::vector<Trade> &trades) {
+  while (quantity > Quantity{0} && !bids_.empty()) {
     auto best_bid = bids_.begin();
+    if (limit_price.has_value() && best_bid->first < *limit_price) {
+      break;
+    }
+
     auto &resting_orders = best_bid->second.orders;
-
-    while (request.quantity > Quantity{0} && !resting_orders.empty()) {
+    while (quantity > Quantity{0} && !resting_orders.empty()) {
       auto resting = resting_orders.begin();
-      const Quantity trade_quantity =
-          std::min(request.quantity, resting->quantity);
+      const Quantity trade_quantity = std::min(quantity, resting->quantity);
 
-      result.trades.push_back(Trade{.aggressor_id = request.id,
-                                    .resting_id = resting->id,
-                                    .price = resting->price,
-                                    .quantity = trade_quantity});
+      trades.push_back(Trade{.aggressor_id = aggressor_id,
+                             .resting_id = resting->id,
+                             .price = resting->price,
+                             .quantity = trade_quantity});
 
-      request.quantity -= trade_quantity;
+      quantity -= trade_quantity;
       resting->quantity -= trade_quantity;
 
       if (resting->quantity == Quantity{0}) {
@@ -331,8 +391,6 @@ SubmitResult MatchingEngine::submit_sell_market(MarketOrderRequest request) {
       bids_.erase(best_bid);
     }
   }
-
-  return result;
 }
 
 void MatchingEngine::rest_order(OrderRequest request) {
@@ -341,25 +399,78 @@ void MatchingEngine::rest_order(OrderRequest request) {
                            .quantity = request.quantity,
                            .sequence = next_sequence_};
 
+  // Measurements showed that insertion hints cost more in shallow books.
   if (request.side == Side::Buy) {
-    auto [level, inserted] = bids_.try_emplace(request.price);
-    (void)inserted;
-    auto order_iterator =
-        level->second.orders.insert(level->second.orders.end(), order);
-    order_index_.emplace(request.id, OrderLocation{.side = request.side,
-                                                   .price = request.price,
-                                                   .order = order_iterator});
+    auto level = bids_.end();
+    bool level_was_inserted = false;
+    if (bids_.size() > 1U && request.price > bids_.begin()->first) {
+      level = bids_.try_emplace(bids_.begin(), request.price);
+      level_was_inserted = true;
+    } else {
+      const auto [found_level, inserted] = bids_.try_emplace(request.price);
+      level = found_level;
+      level_was_inserted = inserted;
+    }
+
+    std::optional<OrderIterator> inserted_order;
+    try {
+      inserted_order =
+          level->second.orders.insert(level->second.orders.end(), order);
+      const auto [index_location, inserted] = order_index_.emplace(
+          request.id, OrderLocation{.side = request.side,
+                                    .price = request.price,
+                                    .order = *inserted_order});
+      (void)index_location;
+      if (!inserted) {
+        throw std::logic_error{"duplicate order ID reached rest_order"};
+      }
+    } catch (...) {
+      if (inserted_order.has_value()) {
+        level->second.orders.erase(*inserted_order);
+      }
+      if (level_was_inserted && level->second.orders.empty()) {
+        bids_.erase(level);
+      }
+      throw;
+    }
+
     ++next_sequence_;
     return;
   }
 
-  auto [level, inserted] = asks_.try_emplace(request.price);
-  (void)inserted;
-  auto order_iterator =
-      level->second.orders.insert(level->second.orders.end(), order);
-  order_index_.emplace(request.id, OrderLocation{.side = request.side,
-                                                 .price = request.price,
-                                                 .order = order_iterator});
+  auto level = asks_.end();
+  bool level_was_inserted = false;
+  if (asks_.size() > 1U && request.price < asks_.begin()->first) {
+    level = asks_.try_emplace(asks_.begin(), request.price);
+    level_was_inserted = true;
+  } else {
+    const auto [found_level, inserted] = asks_.try_emplace(request.price);
+    level = found_level;
+    level_was_inserted = inserted;
+  }
+
+  std::optional<OrderIterator> inserted_order;
+  try {
+    inserted_order =
+        level->second.orders.insert(level->second.orders.end(), order);
+    const auto [index_location, inserted] = order_index_.emplace(
+        request.id, OrderLocation{.side = request.side,
+                                  .price = request.price,
+                                  .order = *inserted_order});
+    (void)index_location;
+    if (!inserted) {
+      throw std::logic_error{"duplicate order ID reached rest_order"};
+    }
+  } catch (...) {
+    if (inserted_order.has_value()) {
+      level->second.orders.erase(*inserted_order);
+    }
+    if (level_was_inserted && level->second.orders.empty()) {
+      asks_.erase(level);
+    }
+    throw;
+  }
+
   ++next_sequence_;
 }
 

@@ -3,9 +3,9 @@
 ## Status
 
 This plan defines the implementation path for an educational C++20 limit order
-book and matching engine. Milestone 5 has added a reproducible benchmark
-baseline after the depth, snapshot, and randomized invariant work. Measured
-optimization remains planned for Milestone 6.
+book and matching engine. Milestone 7 has completed the adversarial review and
+interview explanation after the measured optimization. All milestones in this
+plan are complete.
 
 Milestone status values:
 
@@ -33,6 +33,7 @@ Milestone status values:
 
 - No networking, FIX protocol, database, GUI, web API, persistence, or trading
   strategy.
+- No external order-entry or market-data parser in the current roadmap.
 - No multi-threaded matching core.
 - No lock-free structures, custom allocators, memory pools, or specialized
   hardware assumptions.
@@ -231,6 +232,9 @@ Expected operation costs:
 
 - Submit non-marketable limit order: O(log P) to find/create the price level,
   average O(1) to index by order ID.
+- Resting at a strictly better new best price uses a correct `std::map`
+  insertion hint once multiple levels exist, making that level insertion
+  amortized O(1). Other price-level insertions remain O(log P).
 - Submit marketable limit order: expected O(K), plus O(log P) to rest any
   remainder.
 - Submit market order: expected O(K). No remainder rests.
@@ -278,11 +282,13 @@ overstated expected limit and market matching costs.
 
 - Reducing quantity at the same price preserves time priority.
 - Replacing with the same quantity and same price can be treated as a no-op.
-- Increasing quantity at the same price loses time priority and is implemented
-  as cancel-and-reinsert.
-- Changing price loses time priority and is implemented as cancel-and-reinsert.
+- Increasing quantity at the same price loses time priority and behaves as
+  cancel-and-reinsert.
+- Changing price loses time priority and behaves as cancel-and-reinsert.
 - Replacement must be exception-safe enough that a failed validation does not
   mutate the original order.
+- Potentially throwing allocations are completed before a replacement mutates
+  the original order or opposite-side liquidity.
 - A replacement that behaves as cancel-and-reinsert may trade immediately if the
   new price crosses the opposite side.
 
@@ -579,7 +585,7 @@ Acceptance criteria:
 
 ### Milestone 6: One measured optimization
 
-Status: Planned.
+Status: Complete.
 
 Scope:
 
@@ -597,9 +603,15 @@ Acceptance criteria:
 - Results report improvements and regressions.
 - Unsupported claims are not added.
 
+Measurement note (2026-07-25): the selected optimization gives `std::map`
+insertion a `begin()` hint only when a resting order creates a strictly better
+price in a book with multiple levels. The deep-book workload justified the
+change; before/after results, regressions, rejected alternatives, and risks are
+recorded in `benchmarks/RESULTS.md`.
+
 ### Milestone 7: Adversarial review and interview explanation
 
-Status: Planned.
+Status: Complete.
 
 Scope:
 
@@ -616,6 +628,19 @@ Acceptance criteria:
 - Confirmed findings have regression tests.
 - Final explanation covers data structures, ownership, iterator validity,
   complexity, invariants, rejected alternatives, and measured limitations.
+
+Plan correction (2026-07-25): parsing was previously described in README as
+deferred to a later milestone, but this plan contains no parsing milestone.
+External parsing is now explicitly outside the current roadmap and requires a
+separate future plan.
+
+Review note (2026-07-25): a follow-up adversarial review confirmed allocation
+exception-safety defects in resting insertion, multi-fill result construction,
+and cancel-and-reinsert replacement. Those paths now allocate before mutation or
+roll back partial container insertion. The benchmark latency boundary, benchmark
+identity metadata, and randomized price-time oracle were also corrected. The
+review findings, ownership analysis, residual limitations, and interview
+explanation are recorded in `docs/INTERVIEW_GUIDE.md`.
 
 ## Risks and likely mistakes
 

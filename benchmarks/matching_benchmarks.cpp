@@ -1,5 +1,7 @@
 #include "matching_engine/matching_engine.hpp"
 
+#include "benchmark_timing.hpp"
+
 #include <algorithm>
 #include <array>
 #include <charconv>
@@ -339,7 +341,7 @@ make_highly_marketable_workload(std::size_t event_count) {
   return checksum;
 }
 
-[[nodiscard]] EventOutcome submit_outcome(SubmitResult result) {
+[[nodiscard]] EventOutcome submit_outcome(const SubmitResult &result) {
   std::uint64_t checksum = static_cast<std::uint64_t>(result.error);
   checksum =
       mix_checksum(checksum, static_cast<std::uint64_t>(result.trades.size()));
@@ -349,29 +351,27 @@ make_highly_marketable_workload(std::size_t event_count) {
   return EventOutcome{.error = result.error, .checksum = checksum};
 }
 
-[[nodiscard]] EventOutcome execute_event(MatchingEngine &engine,
+[[nodiscard]] SubmitResult execute_event(MatchingEngine &engine,
                                          const Event &event) {
   if (event.kind == EventKind::Limit) {
-    return submit_outcome(
-        engine.submit_limit(OrderRequest{.id = event.id,
-                                         .side = event.side,
-                                         .price = event.price,
-                                         .quantity = event.quantity}));
+    return engine.submit_limit(OrderRequest{.id = event.id,
+                                            .side = event.side,
+                                            .price = event.price,
+                                            .quantity = event.quantity});
   }
   if (event.kind == EventKind::Market) {
-    return submit_outcome(engine.submit_market(MarketOrderRequest{
-        .id = event.id, .side = event.side, .quantity = event.quantity}));
+    return engine.submit_market(MarketOrderRequest{
+        .id = event.id, .side = event.side, .quantity = event.quantity});
   }
 
-  const ErrorCode error = engine.cancel(event.id);
-  return EventOutcome{.error = error,
-                      .checksum = static_cast<std::uint64_t>(error)};
+  return SubmitResult{.error = engine.cancel(event.id), .trades = {}};
 }
 
 void validate_workload(const Workload &workload) {
   MatchingEngine engine;
   for (std::size_t index = 0; index < workload.events.size(); ++index) {
-    const EventOutcome outcome = execute_event(engine, workload.events[index]);
+    const SubmitResult result = execute_event(engine, workload.events[index]);
+    const EventOutcome outcome = submit_outcome(result);
     if (outcome.error != ErrorCode::None) {
       throw std::runtime_error{"workload validation failed at event " +
                                std::to_string(index)};
@@ -390,7 +390,8 @@ void validate_workload(const Workload &workload) {
   MatchingEngine engine;
   std::uint64_t checksum{};
   for (const Event &event : events) {
-    const EventOutcome outcome = execute_event(engine, event);
+    const SubmitResult result = execute_event(engine, event);
+    const EventOutcome outcome = submit_outcome(result);
     checksum = mix_checksum(checksum, outcome.checksum);
   }
   return checksum;
@@ -416,7 +417,8 @@ void warm_up(const std::vector<Event> &events, std::size_t repetitions) {
     MatchingEngine engine;
     const auto start = Clock::now();
     for (const Event &event : events) {
-      const EventOutcome outcome = execute_event(engine, event);
+      const SubmitResult result = execute_event(engine, event);
+      const EventOutcome outcome = submit_outcome(result);
       checksum = mix_checksum(checksum, outcome.checksum);
     }
     const auto finish = Clock::now();
@@ -458,12 +460,10 @@ void print_latency_result(const Workload &workload,
        ++repetition) {
     MatchingEngine engine;
     for (const Event &event : workload.events) {
-      const auto start = Clock::now();
-      const EventOutcome outcome = execute_event(engine, event);
-      const auto finish = Clock::now();
-      samples.push_back(
-          std::chrono::duration_cast<std::chrono::nanoseconds>(finish - start)
-              .count());
+      const auto timed = matching_engine::benchmark::measure_operation<Clock>(
+          [&engine, &event] { return execute_event(engine, event); });
+      samples.push_back(timed.elapsed.count());
+      const EventOutcome outcome = submit_outcome(timed.result);
       checksum = mix_checksum(checksum, outcome.checksum);
     }
   }
@@ -513,7 +513,7 @@ void print_latency_result(const Workload &workload,
 }
 
 void print_metadata(const Configuration &configuration) {
-  std::cout << "benchmark=matching_engine_baseline\n"
+  std::cout << "benchmark=matching_engine\n"
             << "compiler_id=" << MATCHING_ENGINE_BENCHMARK_COMPILER_ID << '\n'
             << "compiler_version=" << MATCHING_ENGINE_BENCHMARK_COMPILER_VERSION
             << '\n'
@@ -529,8 +529,11 @@ void print_metadata(const Configuration &configuration) {
             << "generator=deterministic_v1\n"
             << "events_per_workload=" << configuration.event_count << '\n'
             << "repetitions=" << configuration.repetitions << '\n'
-            << "warmup_repetitions=" << configuration.warmup_repetitions << '\n'
-            << "latency_note=per-event clock reads are included\n";
+            << "warmup_repetitions=" << configuration.warmup_repetitions
+            << '\n';
+  std::cout
+      << "latency_note=two clock reads perturb each event; sample storage "
+         "and trade-result checksumming are excluded\n";
 }
 
 void run_workload(std::string_view name, const Configuration &configuration) {

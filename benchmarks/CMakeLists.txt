@@ -25,6 +25,17 @@ target_compile_definitions(
     "MATCHING_ENGINE_BENCHMARK_FLAGS=\"${matching_engine_benchmark_flags}\"")
 
 if(MATCHING_ENGINE_BUILD_TESTS)
+  add_executable(matching_engine_benchmark_timing_tests
+                 benchmark_timing_test.cpp)
+  target_compile_features(matching_engine_benchmark_timing_tests
+                          PRIVATE cxx_std_20)
+  set_target_properties(matching_engine_benchmark_timing_tests
+                        PROPERTIES CXX_EXTENSIONS OFF)
+  matching_engine_enable_warnings(matching_engine_benchmark_timing_tests)
+  matching_engine_enable_sanitizers(matching_engine_benchmark_timing_tests)
+  add_test(NAME matching_engine_benchmark_timing_tests
+           COMMAND matching_engine_benchmark_timing_tests)
+
   add_test(
     NAME matching_engine_benchmark_smoke
     COMMAND
@@ -33,7 +44,8 @@ if(MATCHING_ENGINE_BUILD_TESTS)
   set_tests_properties(
     matching_engine_benchmark_smoke
     PROPERTIES PASS_REGULAR_EXPRESSION
-               "result workload=deep_book mode=instrumented_latency samples=20")
+               "result workload=deep_book mode=instrumented_latency samples=20"
+               FAIL_REGULAR_EXPRESSION "matching_engine_baseline")
 
   add_test(
     NAME matching_engine_benchmark_selected_workload

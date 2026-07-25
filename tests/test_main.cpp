@@ -3,11 +3,13 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <exception>
 #include <functional>
 #include <iostream>
 #include <limits>
 #include <map>
+#include <new>
 #include <optional>
 #include <random>
 #include <sstream>
@@ -18,6 +20,64 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
+
+namespace allocation_failure {
+
+thread_local bool enabled = false;
+thread_local std::size_t allocations_before_failure = 0;
+
+bool should_fail() noexcept {
+  if (!enabled) {
+    return false;
+  }
+  if (allocations_before_failure == 0U) {
+    enabled = false;
+    return true;
+  }
+  --allocations_before_failure;
+  return false;
+}
+
+class ScopedFailure {
+public:
+  explicit ScopedFailure(std::size_t allocations) noexcept {
+    allocations_before_failure = allocations;
+    enabled = true;
+  }
+
+  ScopedFailure(const ScopedFailure &) = delete;
+  ScopedFailure &operator=(const ScopedFailure &) = delete;
+
+  ~ScopedFailure() { enabled = false; }
+};
+
+} // namespace allocation_failure
+
+void *operator new(std::size_t size) {
+  if (allocation_failure::should_fail()) {
+    throw std::bad_alloc{};
+  }
+  if (void *memory = std::malloc(size == 0U ? 1U : size)) {
+    return memory;
+  }
+  throw std::bad_alloc{};
+}
+
+void *operator new[](std::size_t size) { return ::operator new(size); }
+
+void operator delete(void *memory) noexcept { std::free(memory); }
+
+void operator delete[](void *memory) noexcept { std::free(memory); }
+
+void operator delete(void *memory, std::size_t size) noexcept {
+  (void)size;
+  std::free(memory);
+}
+
+void operator delete[](void *memory, std::size_t size) noexcept {
+  (void)size;
+  std::free(memory);
+}
 
 namespace {
 
@@ -34,6 +94,7 @@ using matching_engine::ReplaceRequest;
 using matching_engine::SequenceNumber;
 using matching_engine::Side;
 using matching_engine::SnapshotOrder;
+using matching_engine::SubmitResult;
 using matching_engine::Trade;
 
 using TestFunction = void (*)();
@@ -69,6 +130,22 @@ void require_snapshot_order(const SnapshotOrder &order, OrderId id, Side side,
   require(order.sequence == sequence, "snapshot sequence did not match");
 }
 
+void require_same_snapshot(const BookSnapshot &actual,
+                           const BookSnapshot &expected) {
+  require(actual.orders.size() == expected.orders.size(),
+          "snapshot size changed after allocation failure");
+  for (std::size_t index = 0; index < actual.orders.size(); ++index) {
+    const SnapshotOrder &actual_order = actual.orders.at(index);
+    const SnapshotOrder &expected_order = expected.orders.at(index);
+    require(actual_order.id == expected_order.id &&
+                actual_order.side == expected_order.side &&
+                actual_order.price == expected_order.price &&
+                actual_order.quantity == expected_order.quantity &&
+                actual_order.sequence == expected_order.sequence,
+            "snapshot content changed after allocation failure");
+  }
+}
+
 void require_not_crossed(const MatchingEngine &engine) {
   const auto best_bid = engine.best_bid();
   const auto best_ask = engine.best_ask();
@@ -76,6 +153,53 @@ void require_not_crossed(const MatchingEngine &engine) {
     require(*best_bid < *best_ask,
             "book should not be crossed after processing an order");
   }
+}
+
+template <typename Setup, typename Operation, typename VerifyFailure>
+std::size_t
+require_allocation_failures_are_atomic(Setup setup, Operation operation,
+                                       VerifyFailure verify_failure) {
+  constexpr std::size_t maximum_allocation_attempts = 32U;
+  std::size_t observed_failures{};
+  bool eventually_succeeded = false;
+
+  for (std::size_t allocation = 0; allocation < maximum_allocation_attempts;
+       ++allocation) {
+    MatchingEngine engine;
+    setup(engine);
+    const BookSnapshot before = engine.snapshot();
+    const auto best_bid_before = engine.best_bid();
+    const auto best_ask_before = engine.best_ask();
+
+    SubmitResult result;
+    bool allocation_failed = false;
+    try {
+      allocation_failure::ScopedFailure failure{allocation};
+      result = operation(engine);
+    } catch (const std::bad_alloc &) {
+      allocation_failed = true;
+    }
+
+    if (!allocation_failed) {
+      require(result.ok(), "operation failed without throwing bad_alloc");
+      eventually_succeeded = true;
+      break;
+    }
+
+    ++observed_failures;
+    require_same_snapshot(engine.snapshot(), before);
+    require(engine.best_bid() == best_bid_before,
+            "best bid changed after allocation failure");
+    require(engine.best_ask() == best_ask_before,
+            "best ask changed after allocation failure");
+    verify_failure(engine);
+  }
+
+  require(eventually_succeeded,
+          "operation did not succeed after allocation failures were exhausted");
+  require(observed_failures > 0U,
+          "test did not inject an allocation failure into the operation");
+  return observed_failures;
 }
 
 void domain_aliases_use_fixed_width_integers() {
@@ -175,6 +299,67 @@ void non_marketable_limit_orders_rest_and_update_best_prices() {
   require(engine.best_bid() == Price{100}, "best bid should stay unchanged");
   require(engine.best_ask() == Price{105},
           "resting sell should become best ask");
+  require_not_crossed(engine);
+}
+
+void out_of_order_levels_preserve_price_time_priority() {
+  MatchingEngine engine;
+  const auto rest = [&engine](OrderId id, Side side, Price price) {
+    require(engine
+                .submit_limit(OrderRequest{.id = id,
+                                           .side = side,
+                                           .price = price,
+                                           .quantity = Quantity{1}})
+                .ok(),
+            "non-crossing order should rest");
+  };
+
+  rest(OrderId{1}, Side::Buy, Price{98});
+  rest(OrderId{2}, Side::Buy, Price{99});
+  rest(OrderId{3}, Side::Buy, Price{100});
+  rest(OrderId{4}, Side::Buy, Price{97});
+  rest(OrderId{5}, Side::Buy, Price{100});
+
+  rest(OrderId{11}, Side::Sell, Price{103});
+  rest(OrderId{12}, Side::Sell, Price{102});
+  rest(OrderId{13}, Side::Sell, Price{101});
+  rest(OrderId{14}, Side::Sell, Price{104});
+  rest(OrderId{15}, Side::Sell, Price{101});
+
+  const auto duplicate =
+      engine.submit_limit(OrderRequest{.id = OrderId{3},
+                                       .side = Side::Buy,
+                                       .price = Price{101},
+                                       .quantity = Quantity{1}});
+  require(duplicate.error == ErrorCode::DuplicateOrderId,
+          "duplicate active ID should still be rejected");
+  require(duplicate.trades.empty(),
+          "rejected duplicate should not produce trades");
+
+  const auto sell_result = engine.submit_market(MarketOrderRequest{
+      .id = OrderId{20}, .side = Side::Sell, .quantity = Quantity{2}});
+  require(sell_result.ok(), "market sell should consume the best bid level");
+  require(sell_result.trades.size() == 2U,
+          "market sell should consume both best-price bids");
+  require_trade(sell_result.trades.at(0), OrderId{20}, OrderId{3}, Price{100},
+                Quantity{1});
+  require_trade(sell_result.trades.at(1), OrderId{20}, OrderId{5}, Price{100},
+                Quantity{1});
+
+  const auto buy_result = engine.submit_market(MarketOrderRequest{
+      .id = OrderId{21}, .side = Side::Buy, .quantity = Quantity{2}});
+  require(buy_result.ok(), "market buy should consume the best ask level");
+  require(buy_result.trades.size() == 2U,
+          "market buy should consume both best-price asks");
+  require_trade(buy_result.trades.at(0), OrderId{21}, OrderId{13}, Price{101},
+                Quantity{1});
+  require_trade(buy_result.trades.at(1), OrderId{21}, OrderId{15}, Price{101},
+                Quantity{1});
+
+  require(engine.best_bid() == Price{99},
+          "next bid level should become best after matching");
+  require(engine.best_ask() == Price{102},
+          "next ask level should become best after matching");
   require_not_crossed(engine);
 }
 
@@ -366,6 +551,46 @@ void incoming_remainder_rests_after_partial_fill() {
           "unfilled incoming buy quantity should rest");
   require(!engine.best_ask().has_value(), "filled ask level should be removed");
   require_not_crossed(engine);
+}
+
+void maximum_quantity_matching_preserves_conservation() {
+  constexpr Quantity maximum = std::numeric_limits<Quantity>::max();
+  MatchingEngine engine;
+
+  require(engine
+              .submit_limit(OrderRequest{.id = OrderId{1},
+                                         .side = Side::Sell,
+                                         .price = Price{100},
+                                         .quantity = maximum})
+              .ok(),
+          "maximum-quantity ask should rest");
+
+  const auto first_result = engine.submit_market(MarketOrderRequest{
+      .id = OrderId{2}, .side = Side::Buy, .quantity = maximum - Quantity{1}});
+  require(first_result.ok(), "large market buy should succeed");
+  require(first_result.trades.size() == 1U,
+          "large market buy should emit one trade");
+  require_trade(first_result.trades.at(0), OrderId{2}, OrderId{1}, Price{100},
+                maximum - Quantity{1});
+
+  const auto after_partial_fill = engine.snapshot();
+  require(after_partial_fill.orders.size() == 1U,
+          "one unit of the maximum-quantity ask should remain");
+  require_snapshot_order(after_partial_fill.orders.at(0), OrderId{1},
+                         Side::Sell, Price{100}, Quantity{1},
+                         SequenceNumber{0});
+
+  const auto second_result = engine.submit_market(MarketOrderRequest{
+      .id = OrderId{3}, .side = Side::Buy, .quantity = Quantity{2}});
+  require(second_result.ok(), "market buy with excess quantity should succeed");
+  require(second_result.trades.size() == 1U,
+          "only the remaining resting unit should trade");
+  require_trade(second_result.trades.at(0), OrderId{3}, OrderId{1}, Price{100},
+                Quantity{1});
+  require(!engine.best_ask().has_value(),
+          "fully consumed maximum-quantity ask should be removed");
+  require(engine.cancel(OrderId{3}) == ErrorCode::UnknownOrderId,
+          "unfilled market remainder must not become active");
 }
 
 void fifo_priority_is_preserved_at_same_price() {
@@ -1218,6 +1443,183 @@ void invalid_and_unknown_replacements_do_not_mutate_book() {
                 Quantity{5});
 }
 
+void resting_order_allocation_failures_roll_back_all_containers() {
+  for (const Side side : {Side::Buy, Side::Sell}) {
+    const std::size_t failures = require_allocation_failures_are_atomic(
+        [](MatchingEngine &engine) { (void)engine; },
+        [side](MatchingEngine &engine) {
+          return engine.submit_limit(OrderRequest{.id = OrderId{1},
+                                                  .side = side,
+                                                  .price = Price{100},
+                                                  .quantity = Quantity{1}});
+        },
+        [](MatchingEngine &engine) {
+          require(engine.cancel(OrderId{1}) == ErrorCode::UnknownOrderId,
+                  "failed rest left an active index entry");
+        });
+    require(failures >= 3U,
+            "resting-order test did not reach all container allocations");
+  }
+
+  const std::size_t existing_level_failures =
+      require_allocation_failures_are_atomic(
+          [](MatchingEngine &engine) {
+            require(engine
+                        .submit_limit(OrderRequest{.id = OrderId{1},
+                                                   .side = Side::Buy,
+                                                   .price = Price{100},
+                                                   .quantity = Quantity{1}})
+                        .ok(),
+                    "existing-level setup should succeed");
+          },
+          [](MatchingEngine &engine) {
+            return engine.submit_limit(OrderRequest{.id = OrderId{2},
+                                                    .side = Side::Buy,
+                                                    .price = Price{100},
+                                                    .quantity = Quantity{1}});
+          },
+          [](MatchingEngine &engine) {
+            require(engine.cancel(OrderId{2}) == ErrorCode::UnknownOrderId,
+                    "failed existing-level rest left an index entry");
+          });
+  require(existing_level_failures >= 2U,
+          "existing-level test did not reach list and index allocations");
+
+  const std::size_t hinted_level_failures =
+      require_allocation_failures_are_atomic(
+          [](MatchingEngine &engine) {
+            require(engine
+                        .submit_limit(OrderRequest{.id = OrderId{1},
+                                                   .side = Side::Buy,
+                                                   .price = Price{90},
+                                                   .quantity = Quantity{1}})
+                        .ok(),
+                    "hinted-level setup order one should succeed");
+            require(engine
+                        .submit_limit(OrderRequest{.id = OrderId{2},
+                                                   .side = Side::Buy,
+                                                   .price = Price{95},
+                                                   .quantity = Quantity{1}})
+                        .ok(),
+                    "hinted-level setup order two should succeed");
+          },
+          [](MatchingEngine &engine) {
+            return engine.submit_limit(OrderRequest{.id = OrderId{3},
+                                                    .side = Side::Buy,
+                                                    .price = Price{100},
+                                                    .quantity = Quantity{1}});
+          },
+          [](MatchingEngine &engine) {
+            require(engine.cancel(OrderId{3}) == ErrorCode::UnknownOrderId,
+                    "failed hinted rest left an index entry");
+          });
+  require(hinted_level_failures >= 3U,
+          "hinted-level test did not reach all container allocations");
+}
+
+void allocation_failures_leave_multi_fill_submissions_atomic() {
+  const std::size_t limit_failures = require_allocation_failures_are_atomic(
+      [](MatchingEngine &engine) {
+        require(engine
+                    .submit_limit(OrderRequest{.id = OrderId{1},
+                                               .side = Side::Sell,
+                                               .price = Price{100},
+                                               .quantity = Quantity{1}})
+                    .ok(),
+                "first ask setup should succeed");
+        require(engine
+                    .submit_limit(OrderRequest{.id = OrderId{2},
+                                               .side = Side::Sell,
+                                               .price = Price{101},
+                                               .quantity = Quantity{1}})
+                    .ok(),
+                "second ask setup should succeed");
+      },
+      [](MatchingEngine &engine) {
+        return engine.submit_limit(OrderRequest{.id = OrderId{10},
+                                                .side = Side::Buy,
+                                                .price = Price{101},
+                                                .quantity = Quantity{3}});
+      },
+      [](MatchingEngine &engine) {
+        require(engine.cancel(OrderId{10}) == ErrorCode::UnknownOrderId,
+                "failed incoming limit remained active");
+      });
+  require(limit_failures >= 4U,
+          "limit test did not reach trade and rest allocations");
+
+  const std::size_t market_failures = require_allocation_failures_are_atomic(
+      [](MatchingEngine &engine) {
+        require(engine
+                    .submit_limit(OrderRequest{.id = OrderId{1},
+                                               .side = Side::Buy,
+                                               .price = Price{101},
+                                               .quantity = Quantity{1}})
+                    .ok(),
+                "first bid setup should succeed");
+        require(engine
+                    .submit_limit(OrderRequest{.id = OrderId{2},
+                                               .side = Side::Buy,
+                                               .price = Price{100},
+                                               .quantity = Quantity{1}})
+                    .ok(),
+                "second bid setup should succeed");
+      },
+      [](MatchingEngine &engine) {
+        return engine.submit_market(MarketOrderRequest{
+            .id = OrderId{10}, .side = Side::Sell, .quantity = Quantity{2}});
+      },
+      [](MatchingEngine &engine) {
+        require(engine.cancel(OrderId{10}) == ErrorCode::UnknownOrderId,
+                "failed market order remained active");
+      });
+  require(market_failures >= 1U,
+          "market test did not reach trade-result allocation");
+}
+
+void allocation_failures_leave_replacements_atomic() {
+  const std::size_t failures = require_allocation_failures_are_atomic(
+      [](MatchingEngine &engine) {
+        require(engine
+                    .submit_limit(OrderRequest{.id = OrderId{1},
+                                               .side = Side::Buy,
+                                               .price = Price{95},
+                                               .quantity = Quantity{3}})
+                    .ok(),
+                "replacement setup bid should succeed");
+        require(engine
+                    .submit_limit(OrderRequest{.id = OrderId{2},
+                                               .side = Side::Sell,
+                                               .price = Price{100},
+                                               .quantity = Quantity{1}})
+                    .ok(),
+                "replacement setup first ask should succeed");
+        require(engine
+                    .submit_limit(OrderRequest{.id = OrderId{3},
+                                               .side = Side::Sell,
+                                               .price = Price{101},
+                                               .quantity = Quantity{1}})
+                    .ok(),
+                "replacement setup second ask should succeed");
+      },
+      [](MatchingEngine &engine) {
+        return engine.replace(ReplaceRequest{.id = OrderId{1},
+                                             .new_price = Price{101},
+                                             .new_quantity = Quantity{3}});
+      },
+      [](MatchingEngine &engine) {
+        const auto result =
+            engine.replace(ReplaceRequest{.id = OrderId{1},
+                                          .new_price = Price{95},
+                                          .new_quantity = Quantity{3}});
+        require(
+            result.ok() && result.trades.empty(),
+            "failed replacement lost or corrupted the original index entry");
+      });
+  require(failures >= 2U,
+          "replacement test did not reach result and level allocations");
+}
+
 struct ExpectedOrderState {
   Side side;
   Price price;
@@ -1247,9 +1649,37 @@ void require_randomized(bool condition, std::uint32_t seed, std::size_t step,
   }
 }
 
+ExpectedOrders::iterator find_expected_resting_order(ExpectedOrders &orders,
+                                                     Side aggressor_side) {
+  auto expected = orders.end();
+  for (auto candidate = orders.begin(); candidate != orders.end();
+       ++candidate) {
+    if (candidate->second.side == aggressor_side) {
+      continue;
+    }
+    if (expected == orders.end()) {
+      expected = candidate;
+      continue;
+    }
+
+    const bool better_price =
+        aggressor_side == Side::Buy
+            ? candidate->second.price < expected->second.price
+            : candidate->second.price > expected->second.price;
+    const bool earlier_at_same_price =
+        candidate->second.price == expected->second.price &&
+        candidate->second.sequence < expected->second.sequence;
+    if (better_price || earlier_at_same_price) {
+      expected = candidate;
+    }
+  }
+  return expected;
+}
+
 Quantity apply_randomized_trades(const std::vector<Trade> &trades,
                                  OrderId aggressor_id, Side aggressor_side,
                                  Quantity incoming_quantity,
+                                 std::optional<Price> limit_price,
                                  ExpectedOrders &orders, std::uint32_t seed,
                                  std::size_t step,
                                  const std::vector<std::string> &operations) {
@@ -1263,6 +1693,21 @@ Quantity apply_randomized_trades(const std::vector<Trade> &trades,
     require_randomized(trade.quantity <= incoming_quantity - executed, seed,
                        step, operations,
                        "executed quantity exceeds incoming quantity");
+
+    const auto expected_resting =
+        find_expected_resting_order(orders, aggressor_side);
+    require_randomized(expected_resting != orders.end(), seed, step, operations,
+                       "trade occurred without opposite resting liquidity");
+    const bool expected_price_is_eligible =
+        !limit_price.has_value() ||
+        (aggressor_side == Side::Buy
+             ? expected_resting->second.price <= *limit_price
+             : expected_resting->second.price >= *limit_price);
+    require_randomized(expected_price_is_eligible, seed, step, operations,
+                       "trade occurred outside the incoming limit price");
+    require_randomized(trade.resting_id == expected_resting->first, seed, step,
+                       operations,
+                       "trade violated best-price or FIFO priority");
 
     const auto resting = orders.find(trade.resting_id);
     require_randomized(resting != orders.end(), seed, step, operations,
@@ -1281,7 +1726,63 @@ Quantity apply_randomized_trades(const std::vector<Trade> &trades,
     }
   }
 
+  const auto next_resting = find_expected_resting_order(orders, aggressor_side);
+  const bool next_price_is_eligible =
+      next_resting != orders.end() &&
+      (!limit_price.has_value() ||
+       (aggressor_side == Side::Buy
+            ? next_resting->second.price <= *limit_price
+            : next_resting->second.price >= *limit_price));
+  require_randomized(
+      executed == incoming_quantity || !next_price_is_eligible, seed, step,
+      operations, "matching stopped before eligible liquidity was exhausted");
+
   return executed;
+}
+
+void randomized_oracle_rejects_wrong_price_time_matches() {
+  constexpr std::uint32_t seed = 1U;
+  const std::vector<std::string> operations{"handcrafted oracle regression"};
+
+  const auto require_rejected = [&](ExpectedOrders orders, OrderId resting_id) {
+    bool rejected = false;
+    try {
+      (void)apply_randomized_trades(
+          std::vector<Trade>{Trade{.aggressor_id = OrderId{10},
+                                   .resting_id = resting_id,
+                                   .price = orders.at(resting_id).price,
+                                   .quantity = Quantity{1}}},
+          OrderId{10}, Side::Buy, Quantity{1}, Price{101}, orders, seed, 0U,
+          operations);
+    } catch (const std::runtime_error &) {
+      rejected = true;
+    }
+    require(rejected, "randomized oracle accepted an incorrect resting order");
+  };
+
+  require_rejected(
+      ExpectedOrders{
+          {OrderId{1}, ExpectedOrderState{.side = Side::Sell,
+                                          .price = Price{100},
+                                          .quantity = Quantity{1},
+                                          .sequence = SequenceNumber{0}}},
+          {OrderId{2}, ExpectedOrderState{.side = Side::Sell,
+                                          .price = Price{100},
+                                          .quantity = Quantity{1},
+                                          .sequence = SequenceNumber{1}}}},
+      OrderId{2});
+
+  require_rejected(
+      ExpectedOrders{
+          {OrderId{1}, ExpectedOrderState{.side = Side::Sell,
+                                          .price = Price{100},
+                                          .quantity = Quantity{1},
+                                          .sequence = SequenceNumber{0}}},
+          {OrderId{2}, ExpectedOrderState{.side = Side::Sell,
+                                          .price = Price{101},
+                                          .quantity = Quantity{1},
+                                          .sequence = SequenceNumber{1}}}},
+      OrderId{2});
 }
 
 void verify_randomized_state(MatchingEngine &engine,
@@ -1454,8 +1955,9 @@ void deterministic_randomized_events_preserve_invariants() {
       } else {
         require_randomized(result.ok(), seed, step, operations,
                            "valid limit order failed");
-        const Quantity executed = apply_randomized_trades(
-            result.trades, id, side, quantity, orders, seed, step, operations);
+        const Quantity executed =
+            apply_randomized_trades(result.trades, id, side, quantity, price,
+                                    orders, seed, step, operations);
         const Quantity remainder = quantity - executed;
         if (remainder > Quantity{0}) {
           orders.emplace(id, ExpectedOrderState{.side = side,
@@ -1483,8 +1985,9 @@ void deterministic_randomized_events_preserve_invariants() {
       } else {
         require_randomized(result.ok(), seed, step, operations,
                            "valid market order failed");
-        (void)apply_randomized_trades(result.trades, id, side, quantity, orders,
-                                      seed, step, operations);
+        (void)apply_randomized_trades(result.trades, id, side, quantity,
+                                      std::nullopt, orders, seed, step,
+                                      operations);
       }
     } else if (operation == 2U) {
       event << "cancel id=" << id;
@@ -1520,9 +2023,9 @@ void deterministic_randomized_events_preserve_invariants() {
           existing->second.quantity = quantity;
         } else {
           orders.erase(existing);
-          const Quantity executed =
-              apply_randomized_trades(result.trades, id, original.side,
-                                      quantity, orders, seed, step, operations);
+          const Quantity executed = apply_randomized_trades(
+              result.trades, id, original.side, quantity, price, orders, seed,
+              step, operations);
           const Quantity remainder = quantity - executed;
           if (remainder > Quantity{0}) {
             orders.emplace(id, ExpectedOrderState{.side = original.side,
@@ -1582,6 +2085,8 @@ int main() {
       {"empty engine has no best prices", empty_engine_has_no_best_prices},
       {"non-marketable limit orders rest and update best prices",
        non_marketable_limit_orders_rest_and_update_best_prices},
+      {"out-of-order levels preserve price-time priority",
+       out_of_order_levels_preserve_price_time_priority},
       {"exact price match executes and removes filled resting order",
        exact_price_match_executes_and_removes_filled_resting_order},
       {"buy limit matches multiple ask price levels",
@@ -1592,6 +2097,8 @@ int main() {
        partial_fill_leaves_resting_order_active},
       {"incoming remainder rests after partial fill",
        incoming_remainder_rests_after_partial_fill},
+      {"maximum quantity matching preserves conservation",
+       maximum_quantity_matching_preserves_conservation},
       {"FIFO priority is preserved at same price",
        fifo_priority_is_preserved_at_same_price},
       {"sell trade uses resting bid price", sell_trade_uses_resting_bid_price},
@@ -1633,8 +2140,16 @@ int main() {
        crossing_price_change_matches_immediately},
       {"invalid and unknown replacements do not mutate book",
        invalid_and_unknown_replacements_do_not_mutate_book},
+      {"resting order allocation failures roll back all containers",
+       resting_order_allocation_failures_roll_back_all_containers},
+      {"allocation failures leave multi-fill submissions atomic",
+       allocation_failures_leave_multi_fill_submissions_atomic},
+      {"allocation failures leave replacements atomic",
+       allocation_failures_leave_replacements_atomic},
       {"invalid submit paths return validation errors",
        invalid_submit_paths_return_validation_errors},
+      {"randomized oracle rejects wrong price-time matches",
+       randomized_oracle_rejects_wrong_price_time_matches},
       {"deterministic randomized events preserve invariants",
        deterministic_randomized_events_preserve_invariants},
   };

@@ -55,10 +55,25 @@ private:
     OrderIterator order;
   };
 
+  struct MatchPlan {
+    std::size_t trade_count;
+    Quantity remaining_quantity;
+  };
+
   [[nodiscard]] SubmitResult submit_buy_limit(OrderRequest request);
   [[nodiscard]] SubmitResult submit_sell_limit(OrderRequest request);
   [[nodiscard]] SubmitResult submit_buy_market(MarketOrderRequest request);
   [[nodiscard]] SubmitResult submit_sell_market(MarketOrderRequest request);
+  [[nodiscard]] MatchPlan
+  plan_buy_matches(Quantity quantity,
+                   std::optional<Price> limit_price) const noexcept;
+  [[nodiscard]] MatchPlan
+  plan_sell_matches(Quantity quantity,
+                    std::optional<Price> limit_price) const noexcept;
+  void match_buy(OrderId aggressor_id, Quantity &quantity,
+                 std::optional<Price> limit_price, std::vector<Trade> &trades);
+  void match_sell(OrderId aggressor_id, Quantity &quantity,
+                  std::optional<Price> limit_price, std::vector<Trade> &trades);
   void rest_order(OrderRequest request);
 
   BidLevels bids_{};

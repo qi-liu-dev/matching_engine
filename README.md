@@ -10,7 +10,7 @@ trading platform.
 
 ## Current status
 
-Milestone 5 adds a reproducible Release benchmark baseline:
+Milestone 7 completes the adversarial review and interview explanation:
 
 - CMake project configuration
 - project-only compiler warnings
@@ -38,9 +38,14 @@ Milestone 5 adds a reproducible Release benchmark baseline:
 - five deterministic synthetic benchmark workloads
 - separate throughput and instrumented per-event latency measurements
 - benchmark environment and workload metadata
+- a measured new-best price-level insertion hint with documented trade-offs
+- reviewed iterator, index, FIFO, replacement, arithmetic, and crossed-book
+  invariants
+- an interview guide covering design decisions and residual limitations
 - CTest-based tests
 
-Parsing is intentionally deferred to a later milestone.
+External command and market-data parsing are outside the current roadmap and
+would require a separate future plan.
 
 ## Build and test
 
@@ -93,21 +98,31 @@ Each workload is generated and validated before timing. Throughput uses one
 clock interval around a complete event batch and reports events per second.
 Instrumented latency records a clock interval for every event and reports the
 observed minimum, median, mean, and maximum. Each repetition starts with a new
-empty engine. Event execution and result checksumming are included in the
-measurement; workload generation, validation, engine construction, sample
-sorting, and output are excluded.
+empty engine. Throughput includes event execution and result checksumming.
+Per-event latency times event execution but excludes sample storage and
+trade-result checksumming. Workload generation, validation, engine construction,
+sample sorting, and output are excluded from both modes.
 
 Output records the compiler, compiler version and flags, build type, operating
 system, architecture, logical CPU count, event count, repetitions, warm-up, and
 workload name. Compare results only when these settings and the machine
 environment are controlled.
 
-The latency mode includes two clock reads and sample storage per event, so it
-measures instrumented latency rather than an unobserved production latency
-distribution. The harness does not pin threads, disable frequency scaling,
-isolate CPU cores, or report tail percentiles. Short runs can be dominated by
-timer resolution and operating-system noise. The README therefore contains no
-performance claims or stored benchmark numbers.
+The latency mode uses two clock reads per event, so observation perturbs the
+operation even though sample storage is outside the timed interval. It measures
+instrumented latency rather than an unobserved production latency distribution.
+The harness does not pin threads, disable frequency scaling, isolate CPU cores,
+or report tail percentiles. Short runs can be dominated by timer resolution and
+operating-system noise. The README therefore contains no performance claims or
+stored benchmark numbers.
+
+The local Milestone 6 before/after measurements, candidate selection, and risk
+assessment are recorded in
+[`benchmarks/RESULTS.md`](benchmarks/RESULTS.md).
+
+The architecture, ownership model, matching flows, complexity, invariants, and
+review findings are explained in
+[`docs/INTERVIEW_GUIDE.md`](docs/INTERVIEW_GUIDE.md).
 
 ## Domain conventions
 
