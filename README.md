@@ -10,7 +10,8 @@ trading platform.
 
 ## Current status
 
-Milestone 7 completes the adversarial review and interview explanation:
+The implementation includes Milestone 7 and its follow-up correctness
+remediation:
 
 - CMake project configuration
 - project-only compiler warnings
@@ -34,13 +35,15 @@ Milestone 7 completes the adversarial review and interview explanation:
 - deterministic bids-first book snapshots
 - resting-order sequence numbers
 - checked depth aggregation that rejects quantity overflow
-- fixed-seed randomized invariant tests
+- allocation-safe resting insertion, multi-fill submission, and replacement
+- fixed-seed randomized invariant tests with an independent price-time oracle
 - five deterministic synthetic benchmark workloads
 - separate throughput and instrumented per-event latency measurements
 - benchmark environment and workload metadata
+- latency timing that excludes sample storage and trade-result checksumming
 - a measured new-best price-level insertion hint with documented trade-offs
-- reviewed iterator, index, FIFO, replacement, arithmetic, and crossed-book
-  invariants
+- reviewed and remediated iterator, index, FIFO, replacement, arithmetic,
+  exception-safety, and crossed-book invariants
 - an interview guide covering design decisions and residual limitations
 - CTest-based tests
 
@@ -116,9 +119,11 @@ or report tail percentiles. Short runs can be dominated by timer resolution and
 operating-system noise. The README therefore contains no performance claims or
 stored benchmark numbers.
 
-The local Milestone 6 before/after measurements, candidate selection, and risk
-assessment are recorded in
+Historical local Milestone 6 before/after measurements, candidate selection,
+and risk assessment are recorded in
 [`benchmarks/RESULTS.md`](benchmarks/RESULTS.md).
+Those measurements predate the follow-up exception-safety changes and should not
+be treated as current end-to-end throughput results.
 
 The architecture, ownership model, matching flows, complexity, invariants, and
 review findings are explained in
