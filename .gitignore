@@ -3,3 +3,7 @@ build/
 
 # Local editor and OS files
 .DS_Store
+
+# Local development instructions
+AGENTS.md
+PLAN.md
